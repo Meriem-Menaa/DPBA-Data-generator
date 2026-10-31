@@ -1,0 +1,305 @@
+"""
+Generate synthetic OR-scheduling Instances 11-20 using Instance 1.xlsx
+as the workbook-format template.
+
+Requirements:
+    pip install openpyxl
+
+Run:
+    python generate_instances_11_20.py
+
+Outputs:
+    Instance 11.xlsx ... Instance 20.xlsx
+in the same folder as Instance 1.xlsx.
+
+IMPORTANT:
+
+- Instances 11-20 below are newly synthesized extensions, not data
+  published by the article.
+
+"""
+
+from pathlib import Path
+import random
+import math
+import openpyxl
+from openpyxl import Workbook
+
+BASE_DIR = Path(__file__).resolve().parent
+TEMPLATE = BASE_DIR / "Instance 1.xlsx"
+OUTPUT_DIR = BASE_DIR
+N_SCENARIOS = 50
+N_ORS = 10
+PLANNING_HORIZON = 600
+TURNOVER_TIME = 15
+MIN_SURGEON_BREAK = 30
+MAX_OVERTIME = 120
+
+# These are deliberately varied, plausible extensions of the scale of
+# the article's Table 5. They are NOT values reported in that table.
+# Columns: surgeons, operations, collaborative operations,
+#          favourable conditions, unfavourable conditions,
+#          OR requests, requested start times.
+INSTANCE_SPECS = {
+    11: (12, 27, 2, 22, 26, 2, 3),
+    12: (15, 31, 3, 27, 30, 4, 2),
+    13: (11, 24, 1, 19, 23, 2, 2),
+    14: (16, 33, 3, 28, 32, 4, 4),
+    15: (14, 29, 4, 25, 29, 3, 3),
+    16: (10, 18, 1, 12, 17, 1, 1),
+    17: (17, 34, 2, 29, 33, 4, 3),
+    18: (13, 26, 2, 22, 25, 2, 4),
+    19: (15, 30, 1, 25, 29, 3, 2),
+    20: (12, 28, 3, 23, 27, 3, 3),
+}
+
+def clear_sheet(ws):
+    if ws.max_row:
+        ws.delete_rows(1, ws.max_row)
+
+def write_matrix(ws, rows):
+    clear_sheet(ws)
+    for row in rows:
+        ws.append(row)
+
+def scenario_string(values):
+    return ", ".join(str(int(v)) for v in values)
+
+def lognormal_scenarios(rng, is_collaborative=False):
+    """50 integer-minute samples using the article's lognormal ranges."""
+    mu = rng.uniform(4.5, 5.0) if is_collaborative else rng.uniform(3.0, 5.0)
+    sigma = rng.uniform(0.05, 0.30)
+    values = []
+    for _ in range(N_SCENARIOS):
+        # Clamp only to keep the synthesized cases in a practical range.
+        value = int(round(rng.lognormvariate(mu, sigma)))
+        values.append(max(20, min(240, value)))
+    return values
+
+def balanced_assignments(rng, n_ops, n_surgeons, cs_ops):
+    """
+    Assign each ordinary operation to one surgeon and each CS to two.
+    Keep the number of operations per surgeon within the workbook's
+    three-operation columns whenever feasible.
+    """
+    for _ in range(5000):
+        assigned = {s: [] for s in range(1, n_surgeons + 1)}
+        loads = {s: 0 for s in assigned}
+        operation_team = {}
+
+        op_ids = list(range(1, n_ops + 1))
+        rng.shuffle(op_ids)
+        cs_set = set(cs_ops)
+
+        feasible = True
+        for op in op_ids:
+            needed = 2 if op in cs_set else 1
+            candidates = sorted(assigned, key=lambda s: (loads[s], rng.random()))
+            candidates = [s for s in candidates if loads[s] < 3]
+            if len(candidates) < needed:
+                feasible = False
+                break
+            chosen = candidates[:needed]
+            operation_team[op] = chosen
+            for s in chosen:
+                assigned[s].append(op)
+                loads[s] += 1
+
+        if feasible:
+            return assigned, operation_team
+
+    raise RuntimeError(
+        "Could not allocate operations with at most three entries per surgeon. "
+        "Increase the number of surgeons or reduce the number of operations."
+    )
+
+def generate_one(template_path, output_path, spec, seed):
+    n_surgeons, n_ops, n_cs, n_fav, n_unfav, n_or_req, n_start_req = spec
+    output_path = Path(output_path)
+    rng = random.Random(seed)
+
+    if n_cs > n_ops:
+        raise ValueError("Collaborative-operation count cannot exceed operation count.")
+    if n_fav + n_unfav > n_surgeons * N_ORS:
+        raise ValueError("Preference-condition totals exceed available matrix cells.")
+    if n_start_req > n_ops or n_or_req > n_ops:
+        raise ValueError("Request counts cannot exceed the number of operations.")
+
+    wb = openpyxl.load_workbook(template_path)
+
+    required = [
+        "Sheet", "Cooperat_Oper", "Requested_Start", "Opera_By_Surgeon",
+        "a", "b", "c", "p_matrix", "pc_matrix", "Unavailable_Time",
+        "po_matrix", "r_matrix", "Opening_Time"
+    ]
+    missing = [name for name in required if name not in wb.sheetnames]
+    if missing:
+        raise ValueError(f"Template is missing sheets: {missing}")
+
+    # 1) Basic instance dimensions
+    write_matrix(wb["Sheet"], [["Operations", n_ops], ["Surgeons", n_surgeons]])
+
+    # 2) Collaborative operations and surgeon teams
+    cs_ops = sorted(rng.sample(range(1, n_ops + 1), n_cs))
+    assigned, operation_team = balanced_assignments(rng, n_ops, n_surgeons, cs_ops)
+    write_matrix(
+        wb["Cooperat_Oper"],
+        [["Cooperative_Operations"]] + [[op] for op in cs_ops]
+    )
+
+    # 3) Operation-by-surgeon sheet (up to three operation columns)
+    rows = [["Surgeon", "Operation 1", "Operation 2", "Operation 3"]]
+    for surgeon in range(1, n_surgeons + 1):
+        ops = sorted(assigned[surgeon])
+        rows.append([surgeon] + ops + [None] * (3 - len(ops)))
+    write_matrix(wb["Opera_By_Surgeon"], rows)
+
+    # 4) Surgeon eligibility matrix a (surgeons x 10 ORs)
+    # At least 6 elective ORs remain eligible for each surgeon.
+    a = []
+    for _ in range(n_surgeons):
+        row = [1] * N_ORS
+        ineligible_count = rng.randint(0, 2)
+        for k in rng.sample(range(N_ORS), ineligible_count):
+            row[k] = 0
+        a.append(row)
+    write_matrix(wb["a"], a)
+
+    # 5) Favourable and unfavourable OR preference matrices b and c.
+    # The exact totals match the selected synthetic instance specification.
+    all_cells = [(s, k) for s in range(n_surgeons) for k in range(N_ORS)]
+    rng.shuffle(all_cells)
+    b = [[0] * N_ORS for _ in range(n_surgeons)]
+    c = [[0] * N_ORS for _ in range(n_surgeons)]
+
+    fav_cells = []
+    for s, k in all_cells:
+        if a[s][k] == 1 and len(fav_cells) < n_fav:
+            fav_cells.append((s, k))
+    if len(fav_cells) < n_fav:
+        raise ValueError("Not enough eligible surgeon-OR cells for favourable conditions.")
+    for s, k in fav_cells:
+        b[s][k] = 1
+
+    remaining = [(s, k) for s, k in all_cells if (s, k) not in set(fav_cells)]
+    rng.shuffle(remaining)
+    for s, k in remaining[:n_unfav]:
+        c[s][k] = 1
+
+    write_matrix(wb["b"], b)
+    write_matrix(wb["c"], c)
+
+    # 6) Surgery-duration matrix: one row per operation, 50 scenarios.
+    duration_rows = [["Duration"]]
+    operation_durations = {}
+    for op in range(1, n_ops + 1):
+        vals = lognormal_scenarios(rng, is_collaborative=(op in cs_ops))
+        operation_durations[op] = vals
+        duration_rows.append([scenario_string(vals)])
+    write_matrix(wb["p_matrix"], duration_rows)
+
+    # 7) Collaborative surgeon-participation durations and offsets.
+    # The pc/po sheets use two rows per CS and surgeon IDs as columns,
+    # matching the triangular, sparse layout of the supplied workbook.
+    surgeon_headers = [None] + list(range(1, n_surgeons + 1))
+    pc_rows = [surgeon_headers]
+    po_rows = [surgeon_headers]
+    for op in cs_ops:
+        team = operation_team[op]
+        first, second = team[0], team[1]
+        total = operation_durations[op]
+        first_parts, second_parts = [], []
+        for total_d in total:
+            split = rng.uniform(0.25, 0.65)
+            part1 = max(10, int(round(total_d * split)))
+            part2 = max(10, total_d - part1)
+            first_parts.append(part1)
+            second_parts.append(part2)
+
+        pc_row1 = [op] + [None] * n_surgeons
+        pc_row2 = [op] + [None] * n_surgeons
+        po_row1 = [op] + [None] * n_surgeons
+        po_row2 = [op] + [None] * n_surgeons
+
+        pc_row1[first] = scenario_string(first_parts)
+        pc_row2[second] = scenario_string(second_parts)
+        po_row1[first] = scenario_string([0] * N_SCENARIOS)
+        po_row2[second] = scenario_string(first_parts)
+
+        pc_rows.extend([pc_row1, pc_row2])
+        po_rows.extend([po_row1, po_row2])
+
+    write_matrix(wb["pc_matrix"], pc_rows)
+    write_matrix(wb["po_matrix"], po_rows)
+
+    # 8) Surgeon unavailable windows, within the 10-hour planning horizon.
+    unavailable_rows = [["Surgeon", "Start", "End"]]
+    for surgeon in range(1, n_surgeons + 1):
+        start = rng.choice([0, 60, 120, 180, 240, 300])
+        length = rng.choice([60, 120, 180])
+        end = min(PLANNING_HORIZON, start + length)
+        unavailable_rows.append([surgeon, start, end])
+    write_matrix(wb["Unavailable_Time"], unavailable_rows)
+
+    # 9) Requested OR matrix: exactly n_or_req operations request one OR.
+    r_rows = [[None] + [f"OR {k}" for k in range(1, N_ORS + 1)]]
+    requested_ops = set(rng.sample(range(1, n_ops + 1), n_or_req))
+    requested_or = {}
+    for op in range(1, n_ops + 1):
+        row = [f"Operation {op}"] + [0] * N_ORS
+        if op in requested_ops:
+            eligible_ors = [
+                k for k in range(N_ORS)
+                if all(a[s - 1][k] == 1 for s in operation_team[op])
+            ]
+            if not eligible_ors:
+                eligible_ors = [k for k in range(N_ORS) if a[operation_team[op][0] - 1][k] == 1]
+            if not eligible_ors:
+                raise ValueError(f"No eligible OR found for operation {op}.")
+            k = rng.choice(eligible_ors)
+            row[k + 1] = 1
+            requested_or[op] = k + 1
+        r_rows.append(row)
+    write_matrix(wb["r_matrix"], r_rows)
+
+    # 10) Requested start times, selected from reasonable working-day slots.
+    start_rows = [["Operation", "Requested_StartTime"]]
+    start_ops = sorted(rng.sample(range(1, n_ops + 1), n_start_req))
+    for op in start_ops:
+        start_rows.append([op, rng.choice([60, 120, 180, 240, 300, 360, 420, 480])])
+    write_matrix(wb["Requested_Start"], start_rows)
+
+    # 11) Ten ORs, each with a 10-hour desired working day.
+    opening_rows = [["OR", "Open", "Desired_Close_Time"]]
+    for k in range(1, N_ORS + 1):
+        opening_rows.append([k, 0, PLANNING_HORIZON])
+    write_matrix(wb["Opening_Time"], opening_rows)
+
+    # Add workbook metadata/comments documenting the synthetic nature.
+    wb.properties.title = f"Synthetic OR Scheduling Instance {output_path.stem.split()[-1]}"
+    wb.properties.subject = "Synthetic extension based on the workbook structure and article parameter ranges"
+    wb.properties.description = (
+        "Newly synthesized instance. It is not an original instance published in the article. "
+        f"Random seed: {seed}. Duration scenarios: {N_SCENARIOS}."
+    )
+
+    wb.save(output_path)
+
+def main():
+    if not TEMPLATE.exists():
+        raise FileNotFoundError(
+            f"Could not find {TEMPLATE}. Put this script in the same folder as 'Instance 1.xlsx'."
+        )
+
+    for instance_id, spec in INSTANCE_SPECS.items():
+        # Fixed, distinct seeds make the generated dataset reproducible.
+        seed = 20261031 + instance_id * 1009
+        out = OUTPUT_DIR / f"Instance {instance_id}.xlsx"
+        generate_one(TEMPLATE, out, spec, seed)
+        print(f"Created: {out.name}")
+
+    print("\nFinished. Generated Instances 11-20.")
+    print("Keep the seed values and this script with your experimental dataset.")
+
+if __name__ == "__main__":
+    main()
